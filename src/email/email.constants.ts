@@ -1,0 +1,12 @@
+export const EMAIL_OPTIONS = Symbol('EMAIL_OPTIONS');
+export const EMAIL_PROVIDER = Symbol('EMAIL_PROVIDER');
+
+export const EMAIL_DEFAULTS = {
+  MAX_RECIPIENTS: 50,
+  MAX_ATTACHMENT_BYTES: 5 * 1024 * 1024, // 5 MB total
+  RETRIES: 2,
+  RETRY_BASE_DELAY_MS: 500, // backoff: 2^attempt * base
+  MAX_SUBJECT_LENGTH: 200,
+  MAX_EMAIL_LENGTH: 254,
+  ERROR_LOG_MAX_LENGTH: 500,
+} as const;
