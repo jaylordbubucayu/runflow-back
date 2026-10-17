@@ -28,6 +28,7 @@ async function bootstrap() {
     }),
   );
 
+  
   app.enableCors({
     origin: ['https://localhost:3001','https://everyrun-pi.vercel.app'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
