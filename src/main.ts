@@ -26,7 +26,7 @@ async function bootstrap() {
       transform: true,
       forbidNonWhitelisted: true,
     }),
-  );
+  ); 
 
   app.enableCors({
     origin: ['https://localhost:3001','https://everyrun-pi.vercel.app'],
