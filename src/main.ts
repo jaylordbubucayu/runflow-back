@@ -35,9 +35,18 @@ async function bootstrap() {
   });
   app.setGlobalPrefix('api');
 
-  const port = process.env.PORT ?? 3000;
-await app.listen(port);
-  // eslint-disable-next-line no-console
-  console.log(`RunFlow API listening on port ${port}`);
+  // const port = process.env.PORT ?? 3000;
+  
+// await app.listen(port);
+//   // eslint-disable-next-line no-console
+//   console.log(`RunFlow API listening on port ${port}`);
+
+  //for render
+  const port = Number(process.env.PORT) || 3000;
+await app.listen(port, '0.0.0.0');
+
+// eslint-disable-next-line no-console
+console.log(`RunFlow API listening on port ${port}`);
+
 }
 bootstrap();
