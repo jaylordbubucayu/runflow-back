@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { WebhookEventStatus } from '../common/enums';
 import { PaymentWebhookEvent } from './entities/payments-webhook-event.entity';
 import { Payment } from 'src/payments/entities/payment.entity';
-import { PaymentSettlementService } from 'src/payments/payment-settlement.service';
+import { PaidEvidence, PaymentSettlementService } from 'src/payments/payment-settlement.service';
 import { PaymongoService } from 'src/payments/paymongo.service';
 
 /** The only PayMongo event this integration acts on: a Payment Link received a payment. */
@@ -16,8 +16,11 @@ export const LINK_PAID_EVENT = 'link.payment.paid';
  *   2. record the event by PayMongo's event id (redeliveries are recognised and not re-applied),
  *   3. find OUR payment by the link id we stored — the purpose (runner vs organizer) is whatever
  *      that stored row says, never anything in the request,
- *   4. ask PayMongo's API for that link's paid payments and hand them to PaymentSettlementService,
- *      which checks amount/currency and applies the business effect idempotently.
+ *   4. try PayMongo's API for that link's paid payments; if the API does not expose them
+ *      (GET /payment_links/:id returns status=active with no payments), fall back to the
+ *      signature-verified event body itself. Either way the evidence goes through
+ *      PaymentSettlementService, which checks amount/currency against OUR stored row and applies
+ *      the business effect idempotently.
  * Failures after step 2 return 5xx so PayMongo retries; "nothing to do" cases return 200.
  */
 @Injectable()
@@ -92,13 +95,53 @@ export class PaymentWebhookService {
     const payment = await this.findPayment(hints.linkIds, hints.refs);
     if (!payment) return { text: `unknown link ${hints.linkIds.join('|') || '(none)'}`, ignored: true };
 
-    // Amount, currency and "is it really paid" come from PayMongo's API, not from the event body.
+    // Preferred: ask PayMongo's API for the link's paid payments.
     const outcomes = await this.settlement.settleFromProvider(payment.id);
-    if (!outcomes.length) {
-      // PayMongo says paid but the payments list is not showing it (yet): fail so it is retried.
-      throw new ServiceUnavailableException(`Link ${payment.providerCheckoutId} has no paid payment yet`);
+    if (outcomes.length) {
+      return { text: outcomes.map((o) => o.outcome).join(','), paymentId: payment.id };
     }
-    return { text: outcomes.map((o) => o.outcome).join(','), paymentId: payment.id };
+
+    // Fallback: GET /payment_links/:id does not expose payments (it reports status=active), so use
+    // the signature-verified event body. applyPaid still checks amount and currency against the
+    // amount stored on OUR payment row, so a wrong or partial amount is never marked paid.
+    const evidence = PaymentWebhookService.evidenceFromEvent(payload);
+    if (!evidence) {
+      throw new ServiceUnavailableException(`Link ${payment.providerCheckoutId} is not reported paid`);
+    }
+    const outcome = await this.settlement.applyPaid(payment.id, evidence);
+    return { text: `${outcome.outcome} (verified webhook)`, paymentId: payment.id };
+  }
+
+  /**
+   * Builds payment evidence from a link.payment.paid event body. Only call this on an event whose
+   * signature has already been verified (handle() does that first).
+   */
+  static evidenceFromEvent(payload: any): PaidEvidence | null {
+    const link = payload?.data?.attributes?.data;
+    const a = link?.attributes;
+    if (!a || a.status !== 'paid') return null;
+
+    // Use PayMongo's real payment id (pay_…) if the event carries one; otherwise a stable
+    // per-link id, so the same link can never be recorded as two different payments.
+    let payId: string | null = null;
+    const walk = (v: any, depth: number) => {
+      if (payId || depth > 8 || v == null) return;
+      if (typeof v === 'string') {
+        if (/^pay_[A-Za-z0-9]+$/.test(v)) payId = v;
+      } else if (Array.isArray(v)) v.forEach((x) => walk(x, depth + 1));
+      else if (typeof v === 'object') Object.values(v).forEach((x) => walk(x, depth + 1));
+    };
+    walk(a, 0);
+
+    return {
+      providerPaymentId: payId ?? `link-paid:${link.id}`,
+      amountCentavos: Number(a.amount),
+      currency: String(a.currency ?? 'PHP').toUpperCase(),
+      method: null,
+      paidAt: new Date(),
+      source: 'webhook',
+      webhookPayload: payload,
+    };
   }
 
   /** Pulls link ids (`link_…`) and our own references out of an arbitrary event payload. */
