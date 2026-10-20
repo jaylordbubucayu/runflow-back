@@ -116,10 +116,39 @@ export class PaymongoService {
    * The PAID payments of a link — the authoritative answer to "was this link paid, and for how
    * much?". (Link `status` only says active/archived.) Amounts are in centavos.
    */
-  async listPaidPayments(linkId: string): Promise<PaymongoLinkPayment[]> {
-    const json = await this.request('GET', `/payment_links/${encodeURIComponent(linkId)}/payments?status=paid`);
-    return PaymongoService.parsePayments(json);
+async listPaidPayments(linkId: string): Promise<PaymongoLinkPayment[]> {
+  const id = encodeURIComponent(linkId);
+
+  try {
+    const json = await this.request('GET', `/payment_links/${id}/payments?status=paid`);
+    const list = PaymongoService.parsePayments(json);
+    if (list.length) return list;
+  } catch (err: any) {
+    this.logger.warn(`payments sub-endpoint failed for ${linkId}: ${err?.message}`);
   }
+
+  // Fallback: the link resource itself (server-to-server, so still trustworthy).
+  const json = await this.request('GET', `/payment_links/${id}`);
+  const r = json?.data?.attributes
+    ? { id: json.data.id, ...json.data.attributes }
+    : (json?.data ?? json ?? {});
+  this.logger.log(`link ${linkId} status=${r.status} amount=${r.amount} payments=${JSON.stringify(r.payments ?? null)}`);
+
+  const embedded = PaymongoService.parsePayments({ data: r.payments ?? [] });
+  if (embedded.length) return embedded;
+
+  if (r.status === 'paid') {
+    return [{
+      id: `link-paid:${linkId}`, // PayMongo exposes no payment id here; unique per link
+      status: 'paid',
+      amountCentavos: Number(r.amount),
+      currency: String(r.currency ?? 'PHP').toUpperCase(),
+      method: null,
+      paidAt: new Date(),
+    }];
+  }
+  return [];
+}
 
   /** Deactivates a link so it can no longer be paid (used when an attempt is superseded or expires). */
   async archivePaymentLink(linkId: string): Promise<void> {
