@@ -48,6 +48,12 @@ export class EventCategory {
   })
   genderRestriction: GenderRestriction;
 
+  // When THIS category's wave starts (e.g. 5K at 06:30, 21K at 05:00), as a time of day with no
+  // date/zone — the date is the event's eventDate. NULL means "no category-specific time": clients
+  // fall back to the event's own startingTime. MySQL returns it as 'HH:mm:ss'.
+  @Column({ type: 'time', name: 'starting_time', nullable: true })
+  startingTime: string | null;
+
   // Each category has its own full route now (map, distance, elevation, description) — there is
   // no single event-level route anymore. distanceKm above is the category's official race
   // distance (e.g. "10K"); routeDistanceKm here is the actual measured route length, which may
