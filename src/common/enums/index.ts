@@ -110,3 +110,10 @@ export enum CouponDiscountType {
   PERCENTAGE = 'percentage',
   FIXED = 'fixed',
 }
+
+/** Mirrors PayMongo's transfer statuses (pending | succeeded | failed). */
+export enum OrganizerPayoutStatus {
+  PENDING = 'pending',
+  SUCCEEDED = 'succeeded',
+  FAILED = 'failed',
+}

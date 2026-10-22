@@ -8,12 +8,13 @@ import {
   forwardRef,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { randomBytes, randomUUID } from 'crypto';
 import * as bcrypt from 'bcrypt';
 import { Registration } from './entities/registration.entity';
 import { User } from '../users/entities/user.entity';
 import { RunnerProfile } from '../users/entities/runner-profile.entity';
+import { Event } from '../events/entities/event.entity';
 import { EventStatus, RegistrationStatus, UserRole } from '../common/enums';
 import { EventsService } from '../events/events.service';
 import { QrService } from '../common/services/qr.service';
@@ -23,6 +24,11 @@ import { PaymentsService } from '../payments/payments.service';
 import { EmailService } from 'src/email/email.service';
 import { ConfigService } from '@nestjs/config';
 import { Result } from 'src/results/entities/result.entity';
+
+// Each distance prefix owns a block of numbers: 5K -> 5001..5999, 10K -> 10001..10999, etc.
+const BIB_BLOCK_SIZE = 1000;
+// Used when a category name has no number in it (e.g. "Kids Run"): 9001, 9002, ...
+const BIB_FALLBACK_PREFIX = 9;
 
 @Injectable()
 export class RegistrationsService {
@@ -37,7 +43,7 @@ export class RegistrationsService {
     private readonly runnerProfilesRepo: Repository<RunnerProfile>,
     private readonly eventsService: EventsService,
     private readonly qrService: QrService,
-     @Inject(forwardRef(() => PaymentsService))
+    @Inject(forwardRef(() => PaymentsService))
     private readonly paymentsService: PaymentsService,
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
@@ -260,8 +266,6 @@ export class RegistrationsService {
     }
   }
 
-
-
   async getReviewSummary(registrationId: string) {
     const registration = await this.findOrFail(registrationId);
     const category = await this.eventsService.getCategoryOrFail(
@@ -339,76 +343,141 @@ export class RegistrationsService {
   }
 
   // Called by PaymentsService inside a transaction once the webhook confirms payment.
-async markPaid(registrationId: string, manager?: Repository<Registration>) {
-  const repo = manager ?? this.registrationsRepo;
-  const registration = await repo.findOne({ where: { id: registrationId } });
-  if (!registration) throw new NotFoundException('Registration not found');
+  async markPaid(registrationId: string, manager?: Repository<Registration>) {
+    const repo = manager ?? this.registrationsRepo;
+    const registration = await repo.findOne({ where: { id: registrationId } });
+    if (!registration) throw new NotFoundException('Registration not found');
 
-  if (registration.status !== RegistrationStatus.PENDING_PAYMENT) {
-    return registration; // idempotent no-op on retried webhook
+    if (registration.status !== RegistrationStatus.PENDING_PAYMENT) {
+      return registration; // idempotent no-op on retried webhook
+    }
+
+    // Bib is only handed out once payment is confirmed, so abandoned PENDING_PAYMENT
+    // registrations never burn a number or leave gaps.
+    registration.bibNumber =
+      registration.bibNumber ?? (await this.assignBibNumber(repo, registration));
+    registration.status = RegistrationStatus.REGISTERED;
+    registration.registeredAt = new Date();
+    const saved = await repo.save(registration);
+
+    this.sendConfirmationEmail(saved);
+    return saved;
   }
 
-  registration.bibNumber = await this.assignBibNumber(registration.eventId);
-  registration.status = RegistrationStatus.REGISTERED;
-  registration.registeredAt = new Date();
-  const saved = await repo.save(registration);
+  /**
+   * Fire-and-forget: a failed email must never fail the payment webhook.
+   * Uses the in-memory registration, so it doesn't re-read the row the
+   * surrounding transaction may not have committed yet.
+   */
+  private sendConfirmationEmail(registration: Registration) {
+    if (!registration.email) return;
 
-  this.sendConfirmationEmail(saved);
-  return saved;
-}
+    void (async () => {
+      try {
+        const category = await this.eventsService.getCategoryOrFail(registration.categoryId);
+        const event = category.event;
+        const appName = this.configService.get<string>('APP_NAME') ?? 'Runflow';
 
-/**
- * Fire-and-forget: a failed email must never fail the payment webhook.
- * Uses the in-memory registration, so it doesn't re-read the row the
- * surrounding transaction may not have committed yet.
- */
-private sendConfirmationEmail(registration: Registration) {
-  if (!registration.email) return;
+        await this.emailService.sendTemplate({
+          to: registration.email,
+          subject: `You're registered: ${event.name}`,
+          template: 'registration-confirmation',
+          context: {
+            appName,
+            firstName: registration.firstName,
+            eventName: event.name,
+            eventDate: this.formatEventDate(event.eventDate),
+            categoryName: category.name,
+            registrationCode: registration.registrationCode,
+            bibNumber: registration.bibNumber,
+          },
+          metadata: { event: 'registration-confirmation', registrationId: registration.id },
+        });
+      } catch (err) {
+        // Must not throw: this runs detached, so a throw here is an unhandled rejection that can
+        // crash the process right after a payment has been taken.
+        this.logger.warn(
+          `Confirmation email failed for registration ${registration.id}: ${(err as Error).message}`,
+        );
+      }
+    })();
+  }
 
-  void (async () => {
-    try {
-      const category = await this.eventsService.getCategoryOrFail(registration.categoryId);
-      const event = category.event;
-      const appName = this.configService.get<string>('APP_NAME') ?? 'Runflow';
-
-      await this.emailService.sendTemplate({
-        to: registration.email,
-        subject: `You're registered: ${event.name}`,
-        template: 'registration-confirmation',
-        context: {
-          appName,
-          firstName: registration.firstName,
-          eventName: event.name,
-          eventDate: this.formatEventDate(event.eventDate),
-          categoryName: category.name,
-          registrationCode: registration.registrationCode,
-          bibNumber: registration.bibNumber,
-        },
-        metadata: { event: 'registration-confirmation', registrationId: registration.id },
-      });
-    } catch (err) {
-      // Must not throw: this runs detached, so a throw here is an unhandled rejection that can
-      // crash the process right after a payment has been taken.
-      this.logger.warn(
-        `Confirmation email failed for registration ${registration.id}: ${(err as Error).message}`,
-      );
-    }
-  })();
-}
-
-private formatEventDate(value: Date | string | null | undefined): string {
-  if (!value) return '';
-  return new Date(value).toLocaleDateString('en-US', {
-    dateStyle: 'full',
-    timeZone: 'UTC', // eventDate is a calendar date, so avoid shifting it by timezone
-  });
-}
-
-  private async assignBibNumber(eventId: string): Promise<string> {
-    const count = await this.registrationsRepo.count({
-      where: { eventId, status: RegistrationStatus.REGISTERED },
+  private formatEventDate(value: Date | string | null | undefined): string {
+    if (!value) return '';
+    return new Date(value).toLocaleDateString('en-US', {
+      dateStyle: 'full',
+      timeZone: 'UTC', // eventDate is a calendar date, so avoid shifting it by timezone
     });
-    return String(1000 + count + 1);
+  }
+
+  /**
+   * "5K" -> 5, "10K Run" -> 10, "Half Marathon 21K" -> 21. Prefers a number directly before a
+   * "K"; otherwise falls back to the first number in the name. Returns the fallback prefix when
+   * the name has no digits, so a webhook never fails just because of an oddly named category.
+   */
+  private getBibPrefix(categoryName: string): number {
+    const km = categoryName.match(/(\d+)\s*k/i) ?? categoryName.match(/(\d+)/);
+    if (km) return parseInt(km[1], 10);
+    this.logger.warn(
+      `Category "${categoryName}" has no number in its name; using bib prefix ${BIB_FALLBACK_PREFIX}`,
+    );
+    return BIB_FALLBACK_PREFIX;
+  }
+
+  /**
+   * Next bib for this registration's category: 5K -> 5001, 5002...; 10K -> 10001, 10002...
+   *
+   * Concurrency: locks the EVENT row (pessimistic_write) so two simultaneous payments in the same
+   * event can't read the same "max" and hand out the same number. The lock is held until the
+   * surrounding transaction commits. If markPaid wasn't given a transactional repo, this opens its
+   * own short transaction instead. The unique index on (event_id, bib_number) is the final
+   * safety net.
+   *
+   * Categories sharing a prefix (e.g. "5K Men" and "5K Women") share one sequence, so their
+   * bibs never overlap. Bibs outside this prefix's block (like old 1001-style numbers) are
+   * ignored when finding the next one.
+   */
+  private async assignBibNumber(
+    repo: Repository<Registration>,
+    registration: Registration,
+  ): Promise<string> {
+    const category = await this.eventsService.getCategoryOrFail(registration.categoryId);
+    const base = this.getBibPrefix(category.name) * BIB_BLOCK_SIZE; // 5 -> 5000, 10 -> 10000
+
+    const run = async (em: EntityManager): Promise<string> => {
+      await em.findOne(Event, {
+        where: { id: registration.eventId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      const row = await em
+        .createQueryBuilder(Registration, 'r')
+        .select('MAX(CAST(r.bib_number AS UNSIGNED))', 'max')
+        .where('r.event_id = :eventId', { eventId: registration.eventId })
+        .andWhere('r.bib_number IS NOT NULL')
+        .andWhere('CAST(r.bib_number AS UNSIGNED) > :low', { low: base })
+        .andWhere('CAST(r.bib_number AS UNSIGNED) < :high', { high: base + BIB_BLOCK_SIZE })
+        .getRawOne<{ max: string | null }>();
+
+      const next = row?.max ? Number(row.max) + 1 : base + 1;
+      if (next >= base + BIB_BLOCK_SIZE) {
+        this.logger.warn(
+          `Bib block ${base + 1}-${base + BIB_BLOCK_SIZE - 1} is full for event ${registration.eventId}; issuing ${next}`,
+        );
+      }
+
+      const bib = String(next);
+      // Persist inside the lock so the next payment sees it as soon as the lock is released.
+      await em.update(Registration, { id: registration.id }, { bibNumber: bib });
+      return bib;
+    };
+
+    const em = repo.manager;
+    if (em.queryRunner?.isTransactionActive) {
+      return run(em);
+    }
+    return em.transaction(run);
   }
 
   async getMyRegistrations(

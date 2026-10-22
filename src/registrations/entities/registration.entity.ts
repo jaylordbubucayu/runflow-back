@@ -18,6 +18,7 @@ import { Result } from '../../results/entities/result.entity';
 import { Certificate } from '../../certificates/entities/certificate.entity';
 
 @Entity('registrations')
+@Index('uq_registrations_event_bib', ['eventId', 'bibNumber'], { unique: true })
 export class Registration {
   @PrimaryGeneratedColumn({ type: 'bigint' })
   id: string;
